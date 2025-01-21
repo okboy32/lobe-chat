@@ -1,21 +1,35 @@
 import {
   BedrockRuntimeClient,
+  InvokeModelCommand,
   InvokeModelWithResponseStreamCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { AWSBedrockAnthropicStream, AWSBedrockLlama2Stream, StreamingTextResponse } from 'ai';
-import { experimental_buildAnthropicPrompt, experimental_buildLlama2Prompt } from 'ai/prompts';
+import { experimental_buildLlama2Prompt } from 'ai/prompts';
 
 import { LobeRuntimeAI } from '../BaseAI';
 import { AgentRuntimeErrorType } from '../error';
-import { ChatStreamPayload, ModelProvider } from '../types';
+import {
+  ChatCompetitionOptions,
+  ChatStreamPayload,
+  Embeddings,
+  EmbeddingsOptions,
+  EmbeddingsPayload,
+  ModelProvider,
+} from '../types';
+import { buildAnthropicMessages, buildAnthropicTools } from '../utils/anthropicHelpers';
 import { AgentRuntimeError } from '../utils/createError';
 import { debugStream } from '../utils/debugStream';
-import { DEBUG_CHAT_COMPLETION } from '../utils/env';
+import { StreamingResponse } from '../utils/response';
+import {
+  AWSBedrockClaudeStream,
+  AWSBedrockLlamaStream,
+  createBedrockStream,
+} from '../utils/streams';
 
 export interface LobeBedrockAIParams {
   accessKeyId?: string;
   accessKeySecret?: string;
   region?: string;
+  sessionToken?: string;
 }
 
 export class LobeBedrockAI implements LobeRuntimeAI {
@@ -23,55 +37,120 @@ export class LobeBedrockAI implements LobeRuntimeAI {
 
   region: string;
 
-  constructor({ region, accessKeyId, accessKeySecret }: LobeBedrockAIParams) {
+  constructor({ region, accessKeyId, accessKeySecret, sessionToken }: LobeBedrockAIParams = {}) {
     if (!(accessKeyId && accessKeySecret))
       throw AgentRuntimeError.createError(AgentRuntimeErrorType.InvalidBedrockCredentials);
-
     this.region = region ?? 'us-east-1';
-
     this.client = new BedrockRuntimeClient({
       credentials: {
         accessKeyId: accessKeyId,
         secretAccessKey: accessKeySecret,
+        sessionToken: sessionToken,
       },
       region: this.region,
     });
   }
 
-  async chat(payload: ChatStreamPayload) {
-    if (payload.model.startsWith('meta')) return this.invokeLlamaModel(payload);
+  async chat(payload: ChatStreamPayload, options?: ChatCompetitionOptions) {
+    if (payload.model.startsWith('meta')) return this.invokeLlamaModel(payload, options);
 
-    return this.invokeClaudeModel(payload);
+    return this.invokeClaudeModel(payload, options);
+  }
+  /**
+   * Supports the Amazon Titan Text models series.
+   * Cohere Embed models are not supported
+   * because the current text size per request
+   * exceeds the maximum 2048 characters limit
+   * for a single request for this series of models.
+   * [bedrock embed guide] https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-embed.html
+   */
+  async embeddings(payload: EmbeddingsPayload, options?: EmbeddingsOptions): Promise<Embeddings[]> {
+    const input = Array.isArray(payload.input) ? payload.input : [payload.input];
+    const promises = input.map((inputText: string) =>
+      this.invokeEmbeddingModel(
+        {
+          dimensions: payload.dimensions,
+          input: inputText,
+          model: payload.model,
+        },
+        options,
+      ),
+    );
+    return Promise.all(promises);
   }
 
-  private invokeClaudeModel = async (
-    payload: ChatStreamPayload,
-  ): Promise<StreamingTextResponse> => {
-    const command = new InvokeModelWithResponseStreamCommand({
+  private invokeEmbeddingModel = async (
+    payload: EmbeddingsPayload,
+    options?: EmbeddingsOptions,
+  ): Promise<Embeddings> => {
+    const command = new InvokeModelCommand({
       accept: 'application/json',
       body: JSON.stringify({
-        max_tokens_to_sample: payload.max_tokens || 400,
-        prompt: experimental_buildAnthropicPrompt(payload.messages as any),
+        dimensions: payload.dimensions,
+        inputText: payload.input,
+        normalize: true,
       }),
       contentType: 'application/json',
       modelId: payload.model,
     });
+    try {
+      const res = await this.client.send(command, { abortSignal: options?.signal });
+      const responseBody = JSON.parse(new TextDecoder().decode(res.body));
+      return responseBody.embedding;
+    } catch (e) {
+      const err = e as Error & { $metadata: any };
+      throw AgentRuntimeError.chat({
+        error: {
+          body: err.$metadata,
+          message: err.message,
+          type: err.name,
+        },
+        errorType: AgentRuntimeErrorType.ProviderBizError,
+        provider: ModelProvider.Bedrock,
+        region: this.region,
+      });
+    }
+  };
+
+  private invokeClaudeModel = async (
+    payload: ChatStreamPayload,
+    options?: ChatCompetitionOptions,
+  ): Promise<Response> => {
+    const { max_tokens, messages, model, temperature, top_p, tools } = payload;
+    const system_message = messages.find((m) => m.role === 'system');
+    const user_messages = messages.filter((m) => m.role !== 'system');
+
+    const command = new InvokeModelWithResponseStreamCommand({
+      accept: 'application/json',
+      body: JSON.stringify({
+        anthropic_version: 'bedrock-2023-05-31',
+        max_tokens: max_tokens || 4096,
+        messages: await buildAnthropicMessages(user_messages),
+        system: system_message?.content as string,
+        temperature: temperature / 2,
+        tools: buildAnthropicTools(tools),
+        top_p: top_p,
+      }),
+      contentType: 'application/json',
+      modelId: model,
+    });
 
     try {
       // Ask Claude for a streaming chat completion given the prompt
-      const bedrockResponse = await this.client.send(command);
+      const res = await this.client.send(command, { abortSignal: options?.signal });
 
-      // Convert the response into a friendly text-stream
-      const stream = AWSBedrockAnthropicStream(bedrockResponse);
+      const claudeStream = createBedrockStream(res);
 
-      const [debug, output] = stream.tee();
+      const [prod, debug] = claudeStream.tee();
 
-      if (DEBUG_CHAT_COMPLETION) {
+      if (process.env.DEBUG_BEDROCK_CHAT_COMPLETION === '1') {
         debugStream(debug).catch(console.error);
       }
 
       // Respond with the stream
-      return new StreamingTextResponse(output);
+      return StreamingResponse(AWSBedrockClaudeStream(prod, options?.callback), {
+        headers: options?.headers,
+      });
     } catch (e) {
       const err = e as Error & { $metadata: any };
 
@@ -81,38 +160,43 @@ export class LobeBedrockAI implements LobeRuntimeAI {
           message: err.message,
           type: err.name,
         },
-        errorType: AgentRuntimeErrorType.BedrockBizError,
+        errorType: AgentRuntimeErrorType.ProviderBizError,
         provider: ModelProvider.Bedrock,
         region: this.region,
       });
     }
   };
 
-  private invokeLlamaModel = async (payload: ChatStreamPayload) => {
+  private invokeLlamaModel = async (
+    payload: ChatStreamPayload,
+    options?: ChatCompetitionOptions,
+  ): Promise<Response> => {
+    const { max_tokens, messages, model } = payload;
     const command = new InvokeModelWithResponseStreamCommand({
       accept: 'application/json',
       body: JSON.stringify({
-        max_gen_len: payload.max_tokens || 400,
-        prompt: experimental_buildLlama2Prompt(payload.messages as any),
+        max_gen_len: max_tokens || 400,
+        prompt: experimental_buildLlama2Prompt(messages as any),
       }),
       contentType: 'application/json',
-      modelId: payload.model,
+      modelId: model,
     });
 
     try {
       // Ask Claude for a streaming chat completion given the prompt
-      const bedrockResponse = await this.client.send(command);
+      const res = await this.client.send(command);
 
-      // Convert the response into a friendly text-stream
-      const stream = AWSBedrockLlama2Stream(bedrockResponse);
+      const stream = createBedrockStream(res);
 
-      const [debug, output] = stream.tee();
+      const [prod, debug] = stream.tee();
 
-      if (DEBUG_CHAT_COMPLETION) {
+      if (process.env.DEBUG_BEDROCK_CHAT_COMPLETION === '1') {
         debugStream(debug).catch(console.error);
       }
       // Respond with the stream
-      return new StreamingTextResponse(output);
+      return StreamingResponse(AWSBedrockLlamaStream(prod, options?.callback), {
+        headers: options?.headers,
+      });
     } catch (e) {
       const err = e as Error & { $metadata: any };
 
@@ -123,7 +207,7 @@ export class LobeBedrockAI implements LobeRuntimeAI {
           region: this.region,
           type: err.name,
         },
-        errorType: AgentRuntimeErrorType.BedrockBizError,
+        errorType: AgentRuntimeErrorType.ProviderBizError,
         provider: ModelProvider.Bedrock,
         region: this.region,
       });
